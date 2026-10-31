@@ -1,10 +1,10 @@
 # 验证报告
 
-> 生成时间：2026-10-28 · 环境：Ubuntu 24.04 (WSL) / Python 3.12.3 / Node 22.23.4
+> 生成时间：2026-10-31 · 环境：Ubuntu 24.04 (WSL) / Python 3.12.3 / Node 22.23.4
 
 ## 一句话结论
 
-**单测 448 条用例全绿（pytest 收集 454 项，含 6 条参数化展开；1 项跳过）；前端构建通过；15 个页面在真实 Chromium 里零控制台错误；PWA 离线队列 35 项 + 定时任务实跑 15 项端到端全通；8 章流水线跑通并导出。**
+**单测 453 条通过 / 1 条跳过（pytest 收集 454 项，含 6 条参数化展开）；前端构建通过；15 个页面在真实 Chromium 里零控制台错误；PWA 离线队列 35 项 + 定时任务实跑 15 项端到端全通；8 章流水线跑通并导出。**
 
 ## 复现命令
 
@@ -17,7 +17,7 @@ bash scripts/verify-all.sh 8793     # 全量验证，末尾打印 RESULT=PASS|FA
 
 ```
 $ PYTHONPATH=vendor/pylib:. python3 -m pytest tests/ -q
-352 passed, 1 skipped in 66.20s
+453 passed, 1 skipped in 354.58s
 ```
 
 | 文件 | 覆盖 |

@@ -102,7 +102,7 @@ server/
 └── cli.py        命令行（M1：无前端也能跑通）
 web/              Vue 3 + Vite 三栏工作台
 pwa/              移动端灵感速记（离线 queue → 联网同步）
-tests/            224 项单测 + 集成测试
+tests/            454 项单测 + 集成测试
 ```
 
 ---
@@ -291,7 +291,7 @@ REST+SSE 集成（含 M1 全链路验收）。
 ## 验证
 
 完整验证过程与结果见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)，含：
-- 224 项单测分布、前端构建产物
+- 454 项单测分布、前端构建产物
 - 8 章端到端流水线产物核对表
 - 15 个 REST 端点真实 HTTP 状态
 - 14 个页面在真实 Chromium 的渲染结果与截图
