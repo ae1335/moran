@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1116" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>灵感速记 · 网文工作台</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <header>
+    <h1>灵感速记</h1>
+    <div class="status" id="status">离线</div>
+  </header>
+
+  <main>
+    <section class="composer">
+      <textarea id="text" placeholder="想到什么就写什么：桥段、台词、设定、伏笔…"></textarea>
+      <div class="row">
+        <select id="kind">
+          <option value="idea">灵感</option>
+          <option value="hook">断章钩</option>
+          <option value="setting">设定</option>
+          <option value="foreshadow">伏笔</option>
+          <option value="dialogue">台词</option>
+        </select>
+        <button id="save" class="primary">存到本地</button>
+      </div>
+      <p class="hint">离线也能写，联网后自动同步到服务端。</p>
+    </section>
+
+    <section class="list">
+      <h2>待同步 <span id="pendingCount" class="badge">0</span></h2>
+      <ul id="pending"></ul>
+      <h2>已同步</h2>
+      <ul id="synced"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>进度</h2>
+      <div id="progress" class="progress">未连接服务端</div>
+      <div class="row">
+        <button id="sync" class="ghost">立即同步</button>
+        <button id="nightly" class="ghost">触发夜审</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

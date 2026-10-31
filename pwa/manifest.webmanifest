@@ -1,0 +1,17 @@
+{
+  "name": "灵感速记 · 网文工作台",
+  "short_name": "速记",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1116",
+  "theme_color": "#0f1116",
+  "icons": [
+    {
+      "src": "./favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

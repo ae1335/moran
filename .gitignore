@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 依赖（vendored，不入库）
+vendor/
+.npm-cache/
+
+# 运行产物
+.runtime-test/
+logs/
+*.log
+
+# 前端
+web/node_modules/
+web/dist/
+
+# 工作区数据（用户自己的书不入本仓库）
+ws/
+novels/
+workbench/
+workbench-config/.env
+backups/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

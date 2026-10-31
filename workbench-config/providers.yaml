@@ -1,0 +1,56 @@
+# 订阅桥 + 官方 API 统一注册。密钥只写环境变量名，真实值放 .env（§7.3）
+# 桥地址必须是回环地址，公网地址会被拒绝
+providers:
+- name: mock-local
+  kind: mock
+  bridge: mock
+  models:
+  - mock-1
+  enabled: true
+  note: 离线兜底：无 Key / 无网时保证流水线可跑通
+  is_local_bridge: true
+- name: workbuddy-local
+  kind: openai_compat
+  base_url: http://127.0.0.1:8787
+  bridge: workbuddy2api
+  api_key_env: WORKBUDDY_API_KEY
+  models:
+  - glm-5.2
+  - kimi-k2.7
+  - deepseek-v4-pro
+  first_system_only: true
+  enabled: true
+  note: 国际版需首条 system；审核拦截→脱敏重试
+- name: qoder-local
+  kind: openai_compat
+  base_url: http://127.0.0.1:8963
+  bridge: qoder2api
+  api_key_env: QODER_API_KEY
+  health_path: /v1/models
+  models:
+  - qoder/ultimate
+  - qoder/lite
+  enabled: true
+  note: 模型名用档位 key；无 /health，用 /v1/models 探活
+- name: trae-local
+  kind: openai_compat
+  base_url: http://127.0.0.1:19950
+  bridge: trae2api
+  api_key_env: TRAE_API_KEY
+  models:
+  - pro
+  - gpt-5.4
+  enabled: true
+  note: 双区按模型名自动选区；4001=区域错配不重试
+- name: deepseek-official
+  kind: openai_compat
+  base_url: https://api.deepseek.com
+  bridge: ''
+  api_key_env: DEEPSEEK_API_KEY
+  models:
+  - deepseek-chat
+  is_local_bridge: false
+  cost_per_1k_prompt: 0.001
+  cost_per_1k_completion: 0.002
+  enabled: true
+  note: 官方兜底，per_token 计费

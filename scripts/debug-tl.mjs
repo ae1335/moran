@@ -1,0 +1,15 @@
+import { chromium } from '/home/yan/dsh-src/node_modules/.pnpm/playwright-core@1.61.1/node_modules/playwright-core/index.mjs';
+const BASE = 'http://127.0.0.1:8870';
+const dir = encodeURIComponent('novel-《凡人问道》');
+const b = await chromium.launch({ executablePath: '/home/yan/.cache/ms-playwright/chromium-1194/chrome-linux/chrome', args: ['--no-sandbox'] });
+const p = await b.newPage();
+p.on('response', r => { if (r.url().includes('/timeline') || r.url().includes('/foreshadow')) console.log(r.status(), r.url().slice(-60)); });
+p.on('console', m => console.log('[console]', m.text().slice(0, 150)));
+await p.goto(`${BASE}/#/b/${dir}/foreshadow`, { waitUntil: 'networkidle' });
+await p.waitForTimeout(1500);
+const btns = await p.locator('.tabs button').allInnerTexts();
+console.log('tab 按钮:', btns);
+const body = await p.locator('body').innerText();
+console.log('页面是否含「时间线」:', body.includes('时间线'));
+console.log('页面是否含「第 1 章」:', body.includes('第 1 章'));
+await b.close();

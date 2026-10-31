@@ -1,0 +1,154 @@
+/* 全局样式：三栏工作台的视觉底座。
+   深色优先，长文阅读友好；等宽数字用于字数/成本。 */
+
+:root {
+  --bg: #0f1116;
+  --bg-panel: #171a21;
+  --bg-elevated: #1e222b;
+  --bg-hover: #252a35;
+  --border: #2a3039;
+  --border-strong: #3a424f;
+  --text: #e6e9ef;
+  --text-dim: #9aa3b2;
+  --text-faint: #6b7482;
+  --accent: #c9a227;
+  --accent-soft: rgba(201, 162, 39, 0.12);
+  --ok: #4caf7d;
+  --warn: #d9a441;
+  --err: #d9534f;
+  --info: #5b8fb9;
+  --radius: 6px;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  --serif: "Songti SC", "Source Han Serif SC", "Noto Serif CJK SC", serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+button:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.ghost { background: transparent; border-color: var(--border); }
+button.primary { background: var(--accent); color: #1a1508; border-color: var(--accent); font-weight: 600; }
+button.primary:hover:not(:disabled) { background: #d9b23a; border-color: #d9b23a; }
+button.danger { border-color: var(--err); color: #ff8b88; }
+button.sm { padding: 2px 8px; font-size: 12px; }
+
+/* 同时挂 .ghost 和 .primary 时以 primary 为准（各视图用 ghost 做未选中态、primary 做选中态） */
+button.ghost.primary { background: var(--accent); color: #1a1508; border-color: var(--accent); }
+
+input, textarea, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 9px;
+  width: 100%;
+}
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+textarea { resize: vertical; font-family: var(--serif); line-height: 1.9; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #313845; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #414a5a; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--text-dim); }
+.faint { color: var(--text-faint); }
+.small { font-size: 12px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.col { display: flex; flex-direction: column; gap: 8px; }
+.spacer { flex: 1; }
+.wrap { flex-wrap: wrap; }
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.7;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.badge.ok { color: var(--ok); border-color: rgba(76, 175, 125, 0.4); background: rgba(76, 175, 125, 0.1); }
+.badge.warn { color: var(--warn); border-color: rgba(217, 164, 65, 0.4); background: rgba(217, 164, 65, 0.1); }
+.badge.err { color: var(--err); border-color: rgba(217, 83, 79, 0.4); background: rgba(217, 83, 79, 0.1); }
+.badge.info { color: var(--info); border-color: rgba(91, 143, 185, 0.4); background: rgba(91, 143, 185, 0.1); }
+.badge.gold { color: var(--accent); border-color: rgba(201, 162, 39, 0.4); background: var(--accent-soft); }
+
+.card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.empty {
+  color: var(--text-faint);
+  text-align: center;
+  padding: 32px 12px;
+  font-size: 13px;
+}
+
+.divider { height: 1px; background: var(--border); margin: 8px 0; }
+
+.mono-num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* 正文排版 */
+.prose {
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 2;
+  letter-spacing: 0.02em;
+}
+.prose p { margin: 0 0 0.9em; text-indent: 2em; }
+.prose h1, .prose h2 { font-size: 20px; text-indent: 0; margin: 1.2em 0 0.6em; }
+
+/* diff 视图 */
+.diff { font-family: var(--mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+.diff .add { color: #7ddc9f; background: rgba(76, 175, 125, 0.1); display: block; }
+.diff .del { color: #ff8b88; background: rgba(217, 83, 79, 0.1); display: block; }
+.diff .ctx { color: var(--text-dim); display: block; }
+.diff .hunk { color: var(--info); display: block; }
+
+
+/* ---------------------------------------------------------------- 页面骨架
+   各视图重复定义过 .page-head，统一提到这里；局部定义仍可覆盖个别属性。 */
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.page-head h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+.page-head p { margin: 0; }
+.page-head .row { align-items: center; }
+.page > .card + .card { margin-top: 12px; }
+
+.page { padding: 20px 24px; }

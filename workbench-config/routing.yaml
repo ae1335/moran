@@ -1,0 +1,32 @@
+# 订阅桥 + 官方 API 统一注册。密钥只写环境变量名，真实值放 .env（§7.3）
+# 桥地址必须是回环地址，公网地址会被拒绝
+routes:
+  plan:
+  - qoder-local:qoder/ultimate
+  - workbuddy-local:glm-5.2
+  - deepseek-official:deepseek-chat
+  write:
+  - trae-local:pro
+  - workbuddy-local:deepseek-v4-pro
+  - deepseek-official:deepseek-chat
+  review:
+  - workbuddy-local:kimi-k2.7
+  - deepseek-official:deepseek-chat
+  polish:
+  - qoder-local:qoder/lite
+  - trae-local:pro
+  curator:
+  - workbuddy-local:kimi-k2.7
+  - deepseek-official:deepseek-chat
+  summarize:
+  - workbuddy-local:kimi-k2.7
+  - deepseek-official:deepseek-chat
+  deconstruct:
+  - workbuddy-local:glm-5.2
+  - deepseek-official:deepseek-chat
+  free:
+  - workbuddy-local:glm-5.2
+  - deepseek-official:deepseek-chat
+require_terminal:
+  write: true
+circuit_seconds: 600

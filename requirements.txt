@@ -1,0 +1,18 @@
+# 网文工作台 · Python 依赖（Python 3.12）
+# 安装：pip install -r requirements.txt
+# 离线/受限环境：pip install --target vendor/pylib -r requirements.txt
+#                然后 PYTHONPATH=vendor/pylib python -m server.cli ...
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
+PyYAML>=6.0
+GitPython>=3.1
+APScheduler>=3.10
+python-multipart>=0.0.9
+jieba>=0.42          # 中文分词（FTS 查询扩展；缺失时降级为 2-gram）
+numpy>=1.26          # HashEmbedder / 向量检索；缺失时降级纯 BM25
+
+# 开发与测试
+pytest>=8
+pytest-asyncio>=0.23

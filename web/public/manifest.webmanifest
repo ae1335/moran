@@ -1,0 +1,16 @@
+{
+  "name": "网文工作台",
+  "short_name": "工作台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#12141a",
+  "theme_color": "#12141a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

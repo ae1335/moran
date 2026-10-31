@@ -1,0 +1,1549 @@
+"""REST 路由（§17.C 汇总）。
+
+设计约束：
+- 全部走 AppContext 依赖注入，方便单测替换
+- 生成类接口返回 SSE（text/event-stream）
+- 写操作（真相源）一律走原子写入 + 可选 git commit
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+import os
+import json
+import re
+from pathlib import Path
+from typing import Any, AsyncIterator, ClassVar, Literal
+
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
+
+from ..core import atomic
+from ..core.schema import (
+    BookMeta,
+    ChapterOutline,
+    CharacterCard,
+    ForeshadowBook,
+    PlatformProfile,
+    Proposal,
+    ReviewReport,
+    Shelf,
+    Thread,
+    TimelineEntry,
+)
+from ..core.store import StoreError, _assert_plain_stem, count_cn_words
+from .deps import AppContext, get_context
+
+logger = logging.getLogger("workbench.api")
+
+# ------------------------------------------------- 缺陷 #68：入站载荷的通用上界
+#: 逐条给端点加 `_cap_text/_cap_chapters` 是补丁——新加端点时没人会想起加。
+#: 这里给所有 Req 模型一个共同基类，在 pydantic 校验阶段统一兜底：
+#: 任何 str / list 字段超限直接 422（pydantic ValidationError，由 app 层转 400）。
+#: 有了专属守卫的字段在 `CAP_SKIP` 里登记，让它们报更精确的消息。
+MAX_FIELD_STR_CHARS = 100_000
+MAX_FIELD_LIST_ITEMS = 5_000
+
+
+def _over_capped(value: Any, _depth: int = 0) -> str | None:
+    """递归找出超限的字段路径；没有就返回 None。"""
+    if _depth > 6:
+        return None
+    if isinstance(value, str):
+        if len(value) > MAX_FIELD_STR_CHARS:
+            return f"字符串过长（上限 {MAX_FIELD_STR_CHARS} 字）"
+        return None
+    if isinstance(value, list):
+        if len(value) > MAX_FIELD_LIST_ITEMS:
+            return f"列表过长（上限 {MAX_FIELD_LIST_ITEMS} 项）"
+        for item in value:
+            why = _over_capped(item, _depth + 1)
+            if why:
+                return why
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            why = _over_capped(item, _depth + 1)
+            if why:
+                return why
+        return None
+    return None
+
+
+class CappedModel(BaseModel):
+    """所有入站载荷模型的基类（缺陷 #68）。
+
+    职责：新端点只要继承它，就自动带上「字符串 / 列表长度上界」，
+    不需要作者记得手写守卫。已有更精确守卫的字段在 ``CAP_SKIP`` 登记。
+    """
+
+    #: 由专属守卫负责、通用扫描跳过的字段名（它们会报更精确的消息）
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset()
+
+    @model_validator(mode="after")
+    def _cap_all_fields(self):
+        for name in type(self).model_fields:
+            if name in type(self).CAP_SKIP:
+                continue
+            why = _over_capped(getattr(self, name, None))
+            if why:
+                raise ValueError(f"{name} {why}")
+        return self
+
+
+router = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------- 工具
+
+
+def _ctx() -> AppContext:
+    return get_context()
+
+
+def _book(ctx: AppContext, book: str):
+    try:
+        return ctx.book(book) if (ctx.workbench.paths.novels / book / "book.json").exists() else ctx.find_book(book)
+    except StoreError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# ---------------------------------------------------------------- 书架 / 建书
+
+
+class CreateBookReq(CappedModel):
+    title: str
+    genre: str = "玄幻-东方玄幻"
+    platform: str = "tomato"
+    total_chapters: int = 1200
+    daily_chapters: int = 2
+    words_per_chapter: list[int] = Field(default_factory=lambda: [2000, 2400])
+    # 主角补全（可选）
+    protagonist_name: str = "林澈"
+    personality: list[str] = Field(default_factory=lambda: ["外冷内热", "记仇", "对承诺病态执着"])
+    boundaries: list[str] = Field(default_factory=lambda: ["绝不主动屠杀平民", "不接受胁迫下立的誓言"])
+    rank: str = "淬体七重"
+    ceiling: str = "淬体九重"
+    forbidden: str = "本卷内不得突破凝气期"
+    # 题材模板（M8）：传模板 id / 题材名；留空则按 genre 自动匹配
+    template: str = ""
+
+
+class ProtagonistReq(CappedModel):
+    id: str = "mc"
+    name: str = "林澈"
+    role: str = "protagonist"
+    personality: list[str] = Field(default_factory=lambda: ["外冷内热", "记仇", "对承诺病态执着"])
+    boundaries: list[str] = Field(default_factory=lambda: ["绝不主动屠杀平民", "不接受胁迫下立的誓言"])
+    rank: str = "淬体七重"
+    ceiling: str = "淬体九重"
+    forbidden: str = "本卷内不得突破凝气期"
+
+
+@router.get("/health")
+def health(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    return {"ok": True, "root": str(ctx.root), "books": len(ctx.workbench.refresh_shelf().novels)}
+
+
+@router.get("/shelf")
+def get_shelf(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    shelf = ctx.workbench.refresh_shelf()
+    return shelf.model_dump(mode="json")
+
+
+@router.post("/books")
+def create_book(req: CreateBookReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    book = BookMeta(
+        title=req.title,
+        genre=req.genre,
+        platform=req.platform,
+        target={
+            "total_chapters": req.total_chapters,
+            "daily_chapters": req.daily_chapters,
+            "words_per_chapter": tuple(req.words_per_chapter),
+        },
+        current_chapter=0,
+    )
+    try:
+        store = ctx.workbench.create_novel(book, template=req.template or None)
+    except StoreError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    # 主角卡
+    card = CharacterCard(
+        id="mc",
+        name=req.protagonist_name,
+        role="protagonist",
+        personality=req.personality,
+        boundaries=req.boundaries,
+        power_scale={"rank": req.rank, "ceiling": req.ceiling, "forbidden": req.forbidden},
+        first_chapter=1,
+        last_chapter=0,
+    )
+    store.save_character(card)
+
+    # git 初始化 + 首次提交
+    from ..core.gitbot import GitBot
+
+    gb = GitBot(store.root)
+    gb.init()
+    gb.commit_all("init: 建书《%s》" % req.title)
+
+    ctx.invalidate()
+    return {"dir": store.p.root.name, "title": book.title, "path": str(store.root)}
+
+
+@router.get("/books/{book}")
+def book_detail(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    b = bc.store.load_book()
+    return {
+        "meta": b.model_dump(mode="json"),
+        "dir": bc.store.p.root.name,
+        "chapters": bc.store.list_chapters(),
+        "outlines": len(bc.store.list_outlines()),
+        "characters": [c.model_dump(mode="json") for c in bc.store.list_characters()],
+        "profiles": bc.store.list_profiles(),
+        "foreshadow_active": len(bc.store.load_foreshadow().active()),
+    }
+
+
+# ---------------------------------------------------------------- 生成流水线
+
+
+class PlanReq(CappedModel):
+    start_ch: int | None = None
+    count: int = 5
+    save: bool = True
+
+
+@router.post("/books/{book}/plan")
+async def run_plan(book: str, req: PlanReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        res = await bc.planner.plan(start_ch=req.start_ch, count=req.count, save=req.save)
+    except Exception as exc:
+        raise HTTPException(502, f"Planner 失败: {type(exc).__name__}: {exc}") from exc
+    return {
+        "chapters": [c.model_dump(mode="json") for c in res.chapters],
+        "warnings": res.warnings,
+        "alerts": res.alerts,
+        "saved": res.saved,
+        "rewritten": res.rewritten,
+    }
+
+
+class OutlineUpdate(CappedModel):
+    title: str | None = None
+    pov: str | None = None
+    threads: list[str] | None = None
+    scenes: list[dict[str, Any]] | None = None
+    must_include: list[str] | None = None
+    foreshadow_actions: list[dict[str, Any]] | None = None
+    power_events: list[dict[str, Any]] | None = None
+    hook: str | None = None
+    target_words: list[int] | None = None
+    status: str | None = None
+    beat: str | None = None
+    notes: str | None = None
+
+
+@router.get("/books/{book}/outline/{ch}")
+def get_outline(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    o = bc.store.load_outline(ch)
+    if o is None:
+        raise HTTPException(404, f"第 {ch} 章章纲不存在")
+    return o.model_dump(mode="json")
+
+
+@router.put("/books/{book}/outline/{ch}")
+def put_outline(book: str, ch: int, req: OutlineUpdate, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    o = bc.store.load_outline(ch) or ChapterOutline(ch=ch)
+    data = o.model_dump(mode="json")
+    patch = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    # 缺陷 #71：状态机不能只挂在 publish 路由上。PUT /outline/{ch} 是唯一的通用
+    # 章纲写入口，而 OutlineUpdate.status 是裸 str——draft → published 这种跳迁
+    # 以前是被静默接受的：章纲通过了 model_validate（published 是合法枚举值），
+    # 只有 exporter.mark_published 会查 can_outline_transition。作者端看不出异常，
+    # 但 daily-panel 会把它算进已发布、存稿口径随之失真。这里补上同一张迁移表。
+    if "status" in patch:
+        from ..core.domain import can_outline_transition
+
+        src = str(data.get("status") or "draft")
+        dst = str(patch["status"])
+        if dst != src and not can_outline_transition(src, dst):
+            raise HTTPException(
+                409,
+                f"非法状态迁移：{src} → {dst}"
+                f"（章纲状态只能按 draft → planned → writing → drafted → reviewed → final → published 推进）",
+            )
+    data.update(patch)
+    data["ch"] = ch
+    new = ChapterOutline.model_validate(data)
+    bc.store.save_outline(new)
+    return new.model_dump(mode="json")
+
+
+@router.post("/books/{book}/outline/{ch}/confirm")
+def confirm_outline_api(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    o = bc.store.load_outline(ch)
+    if o is None:
+        raise HTTPException(404, f"第 {ch} 章章纲不存在")
+    # 缺陷 #72：这里原先无条件把状态写成 planned，published / final 也能被拉回来。
+    # 「确认」是向前推进，不是倒回——已发布或已定稿的章被拉回 planned 会让
+    # daily-panel 的存稿口径凭空多出一章。与 PUT /outline 共用同一张迁移表。
+    from ..core.domain import can_outline_transition
+
+    src = str(o.status or "draft")
+    dst = "planned"
+    if dst != src and not can_outline_transition(src, dst):
+        raise HTTPException(
+            409,
+            f"非法状态迁移：{src} → {dst}"
+            f"（章纲状态只能按 draft → planned → writing → drafted → reviewed → final → published 推进）",
+        )
+    o.status = dst
+    bc.store.save_outline(o)
+    return {"ch": ch, "status": dst}
+
+
+class GenerateReq(CappedModel):
+    task: Literal["write"] = "write"
+    ch: int
+    stream: bool = True
+    as_version: bool = False
+    temperature: float | None = None
+
+
+@router.post("/books/{book}/generate")
+async def generate(book: str, req: GenerateReq, ctx: AppContext = Depends(_ctx)) -> Any:
+    bc = _book(ctx, book)
+    if not req.stream:
+        try:
+            res = await bc.writer.write(req.ch, as_version=req.as_version, temperature=req.temperature)
+        except Exception as exc:
+            raise HTTPException(502, f"Writer 失败: {type(exc).__name__}: {exc}") from exc
+        return {
+            "ch": res.ch,
+            "words": res.words,
+            "version": res.version,
+            "model": res.model,
+            "warnings": res.warnings,
+            "assembled": res.assembled_path,
+            "text": res.text,
+        }
+
+    async def event_stream() -> AsyncIterator[str]:
+        yield _sse("start", {"ch": req.ch})
+        try:
+            async for chunk in bc.writer.write_stream(req.ch, as_version=req.as_version, temperature=req.temperature):
+                if chunk.done:
+                    # 缺陷 #122：done 事件要把生成告警一起带出去，否则流式路径永远看不到
+                    # 「字数偏少 / 检索降级」这类提示（非流式分支早就带 warnings 了）。
+                    yield _sse(
+                        "done",
+                        {
+                            "ch": req.ch,
+                            "usage": chunk.usage,
+                            "model": chunk.model,
+                            "warnings": list(chunk.warnings),
+                        },
+                    )
+                elif chunk.delta:
+                    yield _sse("delta", {"text": chunk.delta})
+        except Exception as exc:
+            yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class ReviewReq(CappedModel):
+    ch: int
+    scope: str = "full"
+    use_model: bool = True
+
+
+@router.post("/books/{book}/review")
+async def review(book: str, req: ReviewReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        res = await bc.reviewer.review(req.ch, scope=req.scope, use_model=req.use_model)
+    except Exception as exc:
+        raise HTTPException(502, f"Reviewer 失败: {type(exc).__name__}: {exc}") from exc
+    return {
+        "ch": req.ch,
+        "issues": [i.model_dump(mode="json") for i in res.report.issues],
+        "counts": res.counts,
+        "model": res.report.model,
+        "path": res.path,
+    }
+
+
+@router.get("/books/{book}/review/{ch}")
+def get_review(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    r = bc.store.load_review(ch)
+    if r is None:
+        raise HTTPException(404, f"第 {ch} 章暂无审稿报告")
+    return r.model_dump(mode="json")
+
+
+class CurateReq(CappedModel):
+    ch: int
+    use_model: bool = True
+
+
+@router.post("/books/{book}/curate")
+async def curate(book: str, req: CurateReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        res = await bc.curator.curate(req.ch, use_model=req.use_model)
+    except Exception as exc:
+        raise HTTPException(502, f"Curator 失败: {type(exc).__name__}: {exc}") from exc
+    return {
+        "ch": req.ch,
+        "proposals": [p.model_dump(mode="json") for p in res.pack.proposals],
+        "previews": res.previews,
+        "warnings": res.warnings,
+    }
+
+
+class ConfirmReq(CappedModel):
+    ch: int
+    accepted_ids: list[str] | None = None
+    commit: bool = True
+
+
+@router.post("/books/{book}/curate/confirm")
+def curate_confirm(book: str, req: ConfirmReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        return bc.curator.confirm(req.ch, req.accepted_ids, commit=req.commit)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/books/{book}/curate/{ch}")
+def curate_pack(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    pack = bc.curator.load_pack(ch)
+    if pack is None:
+        raise HTTPException(404, f"第 {ch} 章没有提案包")
+    return pack.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------- 真相源
+
+
+@router.get("/books/{book}/truth")
+def list_truth(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    root = bc.store.p.truth
+    files = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            files.append({"path": bc.store.rel(p), "size": p.stat().st_size})
+    return {"files": files}
+
+
+@router.get("/books/{book}/truth/{path:path}")
+def read_truth(book: str, path: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        p = bc.store.resolve(f"truth/{path}")
+    except StoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not p.exists():
+        raise HTTPException(404, f"文件不存在: truth/{path}")
+    if not p.is_file():
+        raise HTTPException(400, f"不是文件: truth/{path}")
+    try:
+        content = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # 缺陷 #87：UnicodeDecodeError 是 ValueError 的子类，会落到全局 ValueError
+        # handler（缺陷 #66）变成 400 + 一长串 codec 报错（实测：`'utf-8' codec
+        # can't decode byte 0xff in position 0`）。真相源里混进二进制文件（截图、
+        # 误拖入的素材）时，作者看到的是看不懂的英文。给一句人话 + 明确路径。
+        raise HTTPException(400, f"truth/{path} 不是 UTF-8 文本（二进制文件无法在此编辑）") from exc
+    return {"path": f"truth/{path}", "content": content}
+
+
+class TruthWrite(CappedModel):
+    content: str
+    commit: bool = True
+    message: str = ""
+
+
+@router.put("/books/{book}/truth/{path:path}")
+def write_truth(book: str, path: str, req: TruthWrite, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        p = bc.store.resolve(f"truth/{path}")
+    except StoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    atomic.write_text_atomic(p, req.content)
+    commit_res = None
+    if req.commit:
+        from ..core.gitbot import GitBot
+
+        gb = GitBot(bc.store.root)
+        commit_res = gb.commit_all(f"truth: 手改 truth/{path} {req.message}".strip()).__dict__
+    return {"path": f"truth/{path}", "bytes": len(req.content.encode("utf-8")), "commit": commit_res}
+
+
+@router.get("/books/{book}/foreshadow")
+def get_foreshadow(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    fb = bc.store.load_foreshadow()
+    current = bc.store.load_book().current_chapter
+    from ..core.domain import overdue_alerts
+
+    return {
+        "items": [i.model_dump(mode="json") for i in fb.items],
+        "active": [i.model_dump(mode="json") for i in fb.active()],
+        "alerts": overdue_alerts(fb, current),
+        "current_chapter": current,
+    }
+
+
+class ForeshadowPatch(CappedModel):
+    status: str | None = None
+    deadline_ch: int | None = None
+    desc: str | None = None
+    payoff_plan: str | None = None
+    dropped_reason: str | None = None
+
+
+@router.patch("/books/{book}/foreshadow/{fid}")
+def patch_foreshadow(book: str, fid: str, req: ForeshadowPatch, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    fb = bc.store.load_foreshadow()
+    item = fb.get(fid)
+    if item is None:
+        raise HTTPException(404, f"伏笔 {fid} 不存在")
+    patch = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    from ..core.domain import can_transition
+
+    if "status" in patch and not can_transition(item.status, patch["status"]):
+        raise HTTPException(409, f"非法状态迁移：{item.status} → {patch['status']}")
+    data = item.model_dump(mode="json")
+    data.update(patch)
+    fb.items = [i for i in fb.items if i.id != fid] + [type(item).model_validate(data)]
+    fb.items.sort(key=lambda i: i.id)
+    bc.store.save_foreshadow(fb)
+    from ..core.gitbot import GitBot
+
+    # 缺陷 #99：原先 commit_all 的返回值直接丢掉——git 挂了（实测 .git/HEAD 被
+    # 外部写坏时 commit_all 返回 ok=False）作者完全不知道自己的真相源没进版本库。
+    _gitres = GitBot(bc.store.root).commit_all(f"truth: 伏笔 {fid} 状态更新")
+    if not _gitres.ok:
+        logger.warning("伏笔 %s 已落盘但 git 提交失败：%s", fid, _gitres.error)
+    out = fb.get(fid).model_dump(mode="json")
+    out["commit"] = _gitres.__dict__
+    return out
+
+
+@router.get("/books/{book}/timeline")
+def get_timeline(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    entries = bc.store.load_timeline()
+    from ..core.domain import validate_timeline
+
+    # 补 days_since_start：前端时间线视图用它算「间隔几天」
+    from ..core.domain import date_to_days, parse_fiction_date
+
+    parsed = [parse_fiction_date(e.date) for e in entries]
+    base = next((d for d in parsed if d is not None), None)
+    base_days = date_to_days(base) if base else None
+    out_entries = []
+    for e, d in zip(entries, parsed):
+        row = e.model_dump(mode="json")
+        row["days_since_start"] = (date_to_days(d) - base_days) if (d and base_days is not None) else None
+        out_entries.append(row)
+
+    return {
+        "entries": out_entries,
+        "issues": [i.__dict__ for i in validate_timeline(entries)],
+    }
+
+
+# ---------------------------------------------------------------- 章节
+
+
+@router.get("/books/{book}/chapters")
+def list_chapters(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    chapters = []
+    for ch in bc.store.list_chapters():
+        o = bc.store.load_outline(ch)
+        chapters.append(
+            {
+                "ch": ch,
+                "title": o.title if o else "",
+                "words": count_cn_words(bc.store.read_chapter(ch)),
+                "status": o.status if o else "unknown",
+                "versions": len(bc.store.list_versions(ch)),
+                "has_review": bc.store.p.review_json(ch).exists(),
+            }
+        )
+    return {"chapters": chapters}
+
+
+@router.get("/books/{book}/chapters/{ch}")
+def get_chapter(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    if not bc.store.chapter_exists(ch):
+        raise HTTPException(404, f"第 {ch} 章不存在")
+    text = bc.store.read_chapter(ch)
+    o = bc.store.load_outline(ch)
+    return {
+        "ch": ch,
+        "text": text,
+        "words": count_cn_words(text),
+        "outline": o.model_dump(mode="json") if o else None,
+        "versions": bc.store.list_versions(ch),
+    }
+
+
+class ChapterWrite(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"text"})
+
+    text: str
+    commit: bool = False
+
+
+@router.put("/books/{book}/chapters/{ch}")
+def put_chapter(book: str, ch: int, req: ChapterWrite, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    _cap_text(req.text, limit=MAX_CHAPTER_CHARS, what="正文")
+    # 缺陷 #75：Writer 两条写路径（writer.py:73-74 / :124-125）早就拒绝覆盖 published，
+    # 但手工保存正文这条路径没查——作者能在前端直接改掉读者已看到的章节。
+    _o = bc.store.load_outline(ch)
+    if _o is not None and _o.status == "published":
+        raise HTTPException(409, f"第 {ch} 章已发布；如需修改请先撤销发布标记")
+    bc.store.write_chapter(ch, req.text)
+    commit_res = None
+    if req.commit:
+        from ..core.gitbot import GitBot
+
+        o = bc.store.load_outline(ch)
+        commit_res = GitBot(bc.store.root).commit_chapter(ch, o.title if o else "", count_cn_words(req.text)).__dict__
+    return {"ch": ch, "words": count_cn_words(req.text), "commit": commit_res}
+
+
+@router.post("/books/{book}/chapters/{ch}/version/{v}/adopt")
+def adopt_version(book: str, ch: int, v: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        return bc.writer.adopt_version(ch, v)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+class ScoreReq(CappedModel):
+    score: int
+    note: str = ""
+
+
+@router.post("/books/{book}/chapters/{ch}/version/{v}/score")
+def score_version(book: str, ch: int, v: int, req: ScoreReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        return bc.writer.score_version(ch, v, req.score, req.note)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ---------------------------------------------------------------- 装配上下文（UI 预览）
+
+
+@router.get("/books/{book}/assembled/{ch}")
+def get_assembled(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    p = bc.store.p.assembled_md(ch)
+    if not p.exists():
+        raise HTTPException(404, f"第 {ch} 章还没有装配记录")
+    return {"ch": ch, "content": p.read_text(encoding="utf-8")}
+
+
+class AssembleReq(CappedModel):
+    ch: int
+    save: bool = True
+
+
+@router.post("/books/{book}/assemble")
+async def assemble(book: str, req: AssembleReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    o = bc.store.load_outline(req.ch)
+    if o is None:
+        raise HTTPException(404, f"第 {req.ch} 章章纲不存在")
+    try:
+        from ..context.assembler import save_assembly
+
+        ctx_obj = await bc.assembler.assemble(o)
+        if req.save:
+            save_assembly(bc.store, ctx_obj)
+    except Exception as exc:
+        raise HTTPException(400, f"装配失败: {type(exc).__name__}: {exc}") from exc
+    return {
+        "ch": req.ch,
+        "total_tokens": ctx_obj.total_tokens,
+        "budget": ctx_obj.budget,
+        "layers": {
+            k: {"title": v.title, "tokens": v.tokens, "trimmed": v.trimmed, "sources": v.source}
+            for k, v in ctx_obj.layers.items()
+        },
+        "warnings": ctx_obj.warnings,
+        "alerts": ctx_obj.foreshadow_alerts,
+        "system_prompt": ctx_obj.system_prompt,
+        "user_prompt": ctx_obj.user_prompt,
+    }
+
+
+# ---------------------------------------------------------------- 模型层 / 用量
+
+
+@router.get("/providers")
+def providers(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    return ctx.gateway.describe()
+
+
+@router.get("/providers/health")
+async def providers_health(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    rows = await ctx.gateway.health(probe=True)
+    return {"providers": rows}
+
+
+@router.post("/routing/reload")
+def routing_reload(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    desc = ctx.gateway.reload()
+    return {"reloaded": True, **desc}
+
+
+@router.get("/usage")
+def usage(days: int = 7, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    data = ctx.usage.usage(days=days)
+    data["incidents"] = ctx.usage.recent_incidents(10)
+    return data
+
+
+@router.get("/usage/chapter/{ch}")
+def usage_chapter(book: str, ch: int, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    return ctx.usage.chapter_cost(ch)
+
+
+# ---------------------------------------------------------------- 设定集 / 封面（M8）
+
+
+@router.get("/books/{book}/setting-book")
+def setting_book_preview(
+    book: str,
+    include_chapters: bool = False,
+    outline_limit: int = 100,
+    ctx: AppContext = Depends(_ctx),
+) -> dict[str, Any]:
+    """设定集预览：不落盘，返回分节清单与字数（M8）。"""
+    bc = _book(ctx, book)
+    res = bc.setting_book.export(
+        include_chapters=include_chapters,
+        outline_limit=max(0, outline_limit),
+        dry_run=True,
+    )
+    return res.as_dict()
+
+
+@router.post("/books/{book}/setting-book")
+def setting_book_export(
+    book: str,
+    include_chapters: bool = False,
+    outline_limit: int = 100,
+    ctx: AppContext = Depends(_ctx),
+) -> dict[str, Any]:
+    """生成设定集：落 exports/{date}/setting-book-{date}.md + .json（M8）。"""
+    bc = _book(ctx, book)
+    res = bc.setting_book.export(
+        include_chapters=include_chapters,
+        outline_limit=max(0, outline_limit),
+    )
+    return res.as_dict()
+
+
+@router.get("/books/{book}/cover/prompt")
+def cover_prompt(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """封面提示词：给外部生图工具用（不调用任何 API）。"""
+    from ..platform.cover import build_prompt
+
+    bc = _book(ctx, book)
+    return {"prompt": build_prompt(bc.store)}
+
+
+@router.post("/books/{book}/cover")
+def cover_generate(
+    book: str,
+    width: int = 600,
+    height: int = 800,
+    use_image_api: bool = False,
+    ctx: AppContext = Depends(_ctx),
+) -> dict[str, Any]:
+    """生成封面（M8）。默认程序化 SVG，零外部依赖。"""
+    bc = _book(ctx, book)
+    # 尺寸做范围校验，避免 100000x100000 这类把浏览器打爆的值
+    w = max(200, min(int(width), 2000))
+    h = max(200, min(int(height), 3000))
+    res = bc.cover.generate(width=w, height=h, use_image_api=use_image_api)
+    data = res.as_dict()
+    data["url"] = f"/api/books/{book}/cover/file" if res.path else ""
+    return data
+
+
+@router.get("/books/{book}/covers")
+def list_covers(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """已生成的封面列表（按修改时间倒序）。只读，不触发生成。"""
+    bc = _book(ctx, book)
+    out = bc.cover.out_dir
+    if not out.exists():
+        return {"count": 0, "items": []}
+    files = sorted(out.glob("*.svg"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return {
+        "count": len(files),
+        "items": [
+            {"path": bc.store.rel(f), "size": f.stat().st_size, "mtime": int(f.stat().st_mtime)}
+            for f in files
+        ],
+    }
+
+
+@router.get("/books/{book}/cover/file")
+def cover_file(book: str, ctx: AppContext = Depends(_ctx)) -> FileResponse:
+    """读取最新封面文件（供 <img> 直接引用）。"""
+    bc = _book(ctx, book)
+    out = bc.cover.out_dir
+    if not out.exists():
+        raise HTTPException(404, "尚未生成封面")
+    files = sorted(out.glob("*.svg"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise HTTPException(404, "尚未生成封面")
+    return FileResponse(files[0], media_type="image/svg+xml")
+
+
+@router.get("/books/{book}/templates")
+def list_templates(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """题材模板库（M8 共享模板）：工作区级 + 书内镜像。"""
+    bc = _book(ctx, book)
+    lib = bc.store.workbench_template_library()
+    items = []
+    for t in lib.list():
+        item = t.as_dict()
+        item["brief"] = t.brief()
+        items.append(item)
+    return {"count": len(items), "items": items, "shared_dir": str(lib.shared_dir)}
+
+
+@router.get("/templates")
+def list_all_templates(ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """工作区级模板库（不依赖具体书）。"""
+    from ..core.templates import TemplateLibrary
+
+    lib = TemplateLibrary(ctx.workbench.paths.shared_templates)
+    items = []
+    for t in lib.list():
+        item = t.as_dict()
+        item["brief"] = t.brief()
+        items.append(item)
+    return {"count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------- 导出 / 日更
+
+
+class ExportReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"chapters"})
+
+    platform: str | None = None
+    chapters: list[int] | None = None
+    mode: str = "合集"
+    allow_risk: bool = False
+    file_format: str = "txt"
+
+
+class PublishReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"chapters"})
+
+    chapters: list[int]
+    published: bool = True
+
+
+@router.post("/books/{book}/publish")
+def publish_chapters(book: str, req: PublishReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """作者手动标记发布/撤销发布；只记录状态，不访问平台（§11.2）。"""
+    bc = _book(ctx, book)
+    _cap_chapters(req.chapters)
+    if not req.chapters:
+        raise HTTPException(400, "chapters 不能为空")
+    result = bc.exporter.mark_published(req.chapters, published=req.published)
+    if not result["updated"] and result["skipped"]:
+        raise HTTPException(409, {"message": "没有可变更的章节", **result})
+    return result
+
+
+@router.get("/books/{book}/export/precheck")
+def export_precheck(
+    book: str,
+    platform: str | None = None,
+    chapters: str | None = None,
+    ctx: AppContext = Depends(_ctx),
+) -> dict[str, Any]:
+    """导出预检：不落盘，只返回每章的红线/字数/钩子问题（§11.1）。
+
+    前端点「导出」前先调这个，让作者在真正生成文件前看到风险。
+    ``chapters`` 形如 ``1,2,3`` 或 ``1-5``。
+    """
+    bc = _book(ctx, book)
+    platform = (platform or bc.store.load_book().platform or "tomato").strip()
+    try:
+        profile = bc.store.load_profile(platform)
+    except StoreError as exc:
+        # 缺陷 #80：platform 非法（比如带 ../）要报 400，不能让它变成 500
+        raise HTTPException(400, str(exc)) from exc
+    nums = _parse_chapter_list(chapters) if chapters else bc.store.list_chapters()
+    if not nums:
+        return {"platform": profile.platform, "chapters": [], "ready": False, "checks": [], "summary": {}}
+    checks = bc.exporter.precheck(nums, profile)
+    high = sum(len(c.high_issues) for c in checks)
+    mid = sum(len(c.mid_issues) for c in checks)
+    return {
+        "platform": profile.platform,
+        "chapters": nums,
+        "ready": high == 0,
+        "summary": {
+            "chapters": len(checks),
+            "high": high,
+            "mid": mid,
+            "ok": sum(1 for c in checks if c.ok),
+        },
+        "checks": [
+            {
+                "ch": c.ch,
+                "title": c.title,
+                "words": c.words,
+                "ok": c.ok,
+                "high_issues": c.high_issues,
+                "mid_issues": c.mid_issues,
+            }
+            for c in checks
+        ],
+    }
+
+
+MAX_CHAPTER_LIST = 5000
+
+
+def _parse_chapter_list(spec: str, *, limit: int = MAX_CHAPTER_LIST) -> list[int]:
+    """``"1,2,5-7"`` → ``[1, 2, 5, 6, 7]``（去重保序）。
+
+    ``limit`` 是硬上限：区间写法（``1-2000000``）本身很便宜，但每个章号后面
+    都要读一遍正文做预检/导出，百万级区间会把单机单用户的服务卡成 DoS。
+    超出上限直接 400，不做静默截断——截断会让作者以为自己选的全都在。
+    """
+    parts = [p.strip() for p in str(spec).replace("，", ",").split(",")]
+    parts = [p for p in parts if p]
+    if len(parts) > MAX_CHAPTER_LIST:
+        raise HTTPException(400, f"章节列表过长（上限 {MAX_CHAPTER_LIST} 项）")
+    out: list[int] = []
+    for part in parts:
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                continue
+            if max(lo, hi) - min(lo, hi) + 1 > limit:
+                raise HTTPException(
+                    400, f"章节区间过大：{part}（单区间上限 {limit} 章）"
+                )
+            out.extend(range(min(lo, hi), max(lo, hi) + 1))
+        else:
+            try:
+                out.append(int(part))
+            except ValueError:
+                continue
+    if len(out) > limit:
+        raise HTTPException(400, f"章节数超出上限（{len(out)} > {limit}）")
+    return list(dict.fromkeys(out))
+
+
+MAX_BENCHMARK_CHARS = 2_000_000
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+MAX_CHAPTER_CHARS = 100_000
+MAX_INSPIRATION_NOTES = 200
+MAX_NOTE_CHARS = 5_000
+#: 读者评论：单条 5 万字足够（长评也不该是本书），再多就是灌水/灌爆磁盘
+MAX_REVIEW_CHARS = 50_000
+
+
+def _cap_chapters(chapters: list[int] | None, *, limit: int = MAX_CHAPTER_LIST) -> list[int] | None:
+    """给直接收 ``list[int]`` 的端点封顶（它们绕过 ``_parse_chapter_list``）。
+
+    publish 会逐章改状态再逐章 git commit，recheck 会逐章重跑 Reviewer——
+    清单放大到十万级就是把单机单用户的服务拖死。超出直接 400，不静默截断。
+    """
+    if chapters is None:
+        return None
+    if len(chapters) > limit:
+        raise HTTPException(400, f"chapters 过多（上限 {limit} 章）")
+    return chapters
+
+
+def _cap_text(text: str, *, limit: int = MAX_BENCHMARK_CHARS, what: str = "正文") -> str:
+    """正文长度硬上限：对标书解析是全文本切片，不设限会整本 10MB 小说灌进来。"""
+    if len(text) > limit:
+        raise HTTPException(400, f"{what}过长（上限 {limit} 字）")
+    return text
+
+
+@router.post("/books/{book}/export")
+def export(book: str, req: ExportReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    # 章节清单也要封顶：每个章号后面都要读正文，百万级清单会把服务卡死
+    if req.chapters is not None and len(req.chapters) > MAX_CHAPTER_LIST:
+        raise HTTPException(400, f"chapters 过多（上限 {MAX_CHAPTER_LIST} 章）")
+    try:
+        res = bc.exporter.export(
+            platform=req.platform, chapters=req.chapters, mode=req.mode, allow_risk=req.allow_risk,
+            file_format=req.file_format,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "platform": res.platform,
+        "out_dir": res.out_dir,
+        "files": res.files,
+        "chapters": res.chapters,
+        "total_words": res.total_words,
+        "report": res.report_path,
+        "blocked": res.blocked,
+        "block_reason": res.block_reason,
+        "risk_ack_required": res.risk_ack_required,
+        "unresolved_high": [
+            {"ch": c.ch, "issues": c.high_issues} for c in res.checks if c.high_issues
+        ],
+    }
+
+
+class NameReq(CappedModel):
+    kind: str = "character"
+    count: int = 10
+    seed: int | None = None
+    gender: str = ""
+    save: bool = True
+
+
+@router.post("/books/{book}/names")
+def generate_names(book: str, req: NameReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """起名生成器（§10.3）：Planner 附属工具，产物进 materials/dictionary/。"""
+    bc = _book(ctx, book)
+    try:
+        pool = bc.naming.generate(
+            kind=req.kind, count=req.count, seed=req.seed, gender=req.gender, save=req.save
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return pool.as_dict()
+
+
+@router.get("/books/{book}/names")
+def list_names(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """读取已有起名词池。"""
+    bc = _book(ctx, book)
+    rows = bc.naming.read_pool()
+    kinds: dict[str, int] = {}
+    for r in rows:
+        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+    return {"total": len(rows), "by_kind": kinds, "names": rows}
+
+
+@router.get("/books/{book}/daily-panel")
+def daily_panel(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    return _book(ctx, book).exporter.daily_panel()
+
+
+@router.get("/books/{book}/stats")
+def book_stats(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    return {
+        "overview": bc.stats.overview(),
+        "word_curve": bc.stats.word_curve(),
+        "daily_words": bc.stats.daily_words(),
+        "pacing": bc.stats.pacing_vs_benchmark(),
+    }
+
+
+# ---------------------------------------------------------------- 反 AI 味
+
+
+class PolishReq(CappedModel):
+    ch: int
+    use_model: bool = False
+    apply: bool = False
+
+
+class FixPreviewReq(CappedModel):
+    indices: list[int] | None = None
+
+
+@router.get("/books/{book}/review/{ch}/suggest")
+def review_suggest(
+    book: str, ch: int, indices: str | None = None, ctx: AppContext = Depends(_ctx)
+) -> dict[str, Any]:
+    """按审稿问题生成改写预览（不落盘）。§13.2「diff 预览」。"""
+    bc = _book(ctx, book)
+    idx_list = _parse_chapter_list(indices, limit=20) if indices else None
+    batch = bc.fix_suggester.suggest(ch, idx_list)
+    return batch.as_dict()
+
+
+@router.post("/books/{book}/review/{ch}/suggest")
+def review_suggest_selected(
+    book: str, ch: int, req: FixPreviewReq, ctx: AppContext = Depends(_ctx)
+) -> dict[str, Any]:
+    """只预览选中项（逐条采纳）。"""
+    bc = _book(ctx, book)
+    return bc.fix_suggester.suggest(ch, req.indices).as_dict()
+
+
+@router.post("/books/{book}/polish")
+async def polish(book: str, req: PolishReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    try:
+        res = await bc.polish.polish(req.ch, use_model=req.use_model, apply=req.apply)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "ch": req.ch,
+        "issues": [i.__dict__ for i in res.issues],
+        "diff": res.diff,
+        "applied": res.applied,
+        "rewritten": res.rewritten,
+        "warnings": res.warnings,
+        "original_words": res.original_words,
+    }
+
+
+# ---------------------------------------------------------------- 反馈
+
+
+class FeedbackStatsReq(CappedModel):
+    date: str | None = None
+    reads: int | None = None
+    retention: float | None = None
+    chapters: dict[str, Any] | None = None
+
+
+@router.post("/books/{book}/feedback/stats")
+def feedback_stats(book: str, req: FeedbackStatsReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    payload = {k: v for k, v in req.model_dump(exclude_none=True).items()}
+    if not payload:
+        raise HTTPException(400, "空载荷")
+    return bc.feedback.save_stats(payload)
+
+
+class FeedbackReviewReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"text"})
+
+    text: str
+
+
+@router.post("/books/{book}/feedback/reviews/{ch}")
+def feedback_review(book: str, ch: int, req: FeedbackReviewReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """缺陷 #67：读者评论长度上界（此前 5MB 也照收）。"""
+    _cap_text(req.text, limit=MAX_REVIEW_CHARS, what="评论")
+    return _book(ctx, book).feedback.save_review(ch, req.text)
+
+
+@router.get("/books/{book}/feedback")
+def feedback_get(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    return _book(ctx, book).feedback.load()
+
+
+class RecheckReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"chapters"})
+
+    chapters: list[int] | None = None
+    top_pct: float = 0.05
+    # 保留字段以兼容旧客户端；true 也不会直接写入，必须走 confirm。
+    apply: bool = False
+
+
+async def _fresh_feedback_recheck(bc: Any, chapters: list[int] | None, top_pct: float):
+    """预览与确认共用同一份 fresh Reviewer 证据，避免提案 ID 前后不一致。"""
+    first = bc.feedback.recheck(chapters, top_pct=top_pct)
+    fresh_reviews: dict[int, Any] = {}
+    for ch in first.chapters:
+        if not bc.store.read_chapter(ch).strip():
+            continue
+        fresh_reviews[ch] = (await bc.reviewer.review(ch, scope="full", use_model=False, save=False)).report
+    return bc.feedback.recheck(first.chapters, top_pct=top_pct, reviews=fresh_reviews)
+
+
+@router.post("/books/{book}/feedback/recheck")
+async def feedback_recheck(book: str, req: RecheckReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """定向复盘预览：重跑 Reviewer 规则层，只生成提案，不写真相源（§12.2）。"""
+    _cap_chapters(req.chapters)
+    res = await _fresh_feedback_recheck(_book(ctx, book), req.chapters, req.top_pct)
+    return {
+        "chapters": res.chapters,
+        "findings": res.findings,
+        "proposals": res.proposals,
+        "applied": 0,
+        "confirmation_required": True,
+        "legacy_apply_ignored": req.apply,
+    }
+
+
+class RecheckConfirmReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"chapters"})
+
+    accepted_ids: list[str]
+    chapters: list[int] | None = None
+    top_pct: float = 0.05
+
+
+@router.post("/books/{book}/feedback/recheck/confirm")
+async def feedback_recheck_confirm(book: str, req: RecheckConfirmReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """按提案 ID 确认后落盘；服务端重算提案，不信任客户端提交的文本。"""
+    bc = _book(ctx, book)
+    if not req.accepted_ids:
+        raise HTTPException(400, "accepted_ids 不能为空；先预览并选择避雷提案")
+    _cap_chapters(req.chapters)
+    res = await _fresh_feedback_recheck(bc, req.chapters, req.top_pct)
+    selected = [p for p in res.proposals if p["id"] in set(req.accepted_ids)]
+    if not selected:
+        raise HTTPException(404, "没有匹配的提案；请重新预览后确认")
+    out = bc.feedback.apply_proposals(selected)
+    return {**out, "confirmed_ids": [p["id"] for p in selected], "entries": [p["entry"] for p in selected]}
+
+
+# ---------------------------------------------------------------- 拆书
+
+
+class BenchmarkReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"content"})
+
+    title: str
+    content: str | None = None
+    use_model: bool = True
+
+
+@router.get("/books/{book}/benchmarks")
+def benchmarks(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    from ..agents.deconstructor import list_benchmarks
+
+    return {"benchmarks": list_benchmarks(_book(ctx, book).store.p.root)}
+
+
+@router.post("/books/{book}/benchmarks/import")
+async def benchmark_import(book: str, req: BenchmarkReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    if not req.content:
+        raise HTTPException(400, "content 不能为空（也可以用 /benchmarks/upload 上传文件）")
+    _cap_text(req.content)
+    try:
+        res = await bc.deconstructor.analyze(title=req.title, content=req.content, use_model=req.use_model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "id": res.id,
+        "title": res.title,
+        "chapters": res.chapters,
+        "words": res.words,
+        "products": res.products,
+        "warnings": res.warnings,
+        "structure": res.structure,
+    }
+
+
+@router.post("/books/{book}/benchmarks/upload")
+async def benchmark_upload(
+    book: str,
+    file: UploadFile = File(...),
+    title: str | None = Query(None),
+    use_model: bool = Query(True),
+    ctx: AppContext = Depends(_ctx),
+) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    # 缺陷 #112：先 read() 再判大小 = 先把整个文件吞进内存（>1MB 时 Starlette
+    # 已落 SpooledTemporaryFile，seek+tell 就能拿到大小）。8MB 上限形同虚设：
+    # 一个 2GB 的上传会先把 2GB 读进来，然后才回 400。这里改成读前先探。
+    _size = file.size
+    if _size is None:
+        try:
+            file.file.seek(0, os.SEEK_END)
+            _size = file.file.tell()
+            file.file.seek(0)
+        except Exception:
+            _size = None
+    if _size is not None and _size > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"文件过大（上限 {MAX_UPLOAD_BYTES // 1024 // 1024} MB）")
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"文件过大（上限 {MAX_UPLOAD_BYTES // 1024 // 1024} MB）")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("gbk")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", "replace")
+    name = title or (file.filename or "未命名对标书").rsplit(".", 1)[0]
+    _cap_text(text)
+    try:
+        res = await bc.deconstructor.analyze(title=name, content=text, use_model=use_model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"id": res.id, "title": res.title, "chapters": res.chapters, "words": res.words, "products": res.products}
+
+
+@router.get("/books/{book}/benchmarks/{bid}")
+def benchmark_detail(book: str, bid: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    # 缺陷 #79：bid 是路径的一段，必须是没有分隔符的纯目录名。
+    # 否则 bid=.. 会读到 analysis/ 本身（里面有模板、对标产物等作者没打算暴露的文件），
+    # 靠「后端先拼路径再判存在」挡不住，因为 .. 拼出来的目录本来就存在。
+    try:
+        safe_bid = _assert_plain_stem(bid, "对标书 id")
+    except StoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    base = bc.store.p.root / "analysis" / "benchmarks" / safe_bid
+    if not base.exists():
+        raise HTTPException(404, f"对标书产物不存在: {safe_bid}")
+    out: dict[str, Any] = {"id": bid, "files": {}}
+    for f in base.iterdir():
+        # 缺陷 #91：binary.bin 之类混进产物目录时裸 read_text 抛 UnicodeDecodeError，
+        # 它是 ValueError 子类会被全局 handler 转成英文 400。读不出的文件跳过。
+        if f.is_file():
+            txt = atomic.read_text(f, None)
+            if txt is not None:
+                out["files"][f.name] = txt
+    return out
+
+
+# ---------------------------------------------------------------- 检索
+
+
+@router.post("/books/{book}/index/build")
+def index_build(book: str, full: bool = False, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    if bc.retrieval is None:
+        raise HTTPException(503, "检索层未启用")
+    return bc.retrieval.build_index(full=full)
+
+
+@router.get("/books/{book}/index/stats")
+def index_stats(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    if bc.retrieval is None:
+        return {"available": False}
+    return {"available": bc.retrieval.available, **bc.retrieval.stats()}
+
+
+@router.get("/books/{book}/index/verify")
+def index_verify(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    if bc.retrieval is None:
+        raise HTTPException(503, "检索层未启用")
+    return bc.retrieval.verify()
+
+
+# ---------------------------------------------------------------- git 时光机
+
+
+@router.get("/books/{book}/git/log")
+def git_log(book: str, limit: int = 50, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    from ..core.gitbot import GitBot
+
+    gb = GitBot(_book(ctx, book).store.root)
+    return {"log": gb.log(limit), "tags": gb.tags()}
+
+
+@router.get("/books/{book}/git/show")
+def git_show(book: str, rev: str, path: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    from ..core.gitbot import GitBot
+
+    bc = _book(ctx, book)
+    content = GitBot(bc.store.root).show_file_at(rev, path)
+    if content is None:
+        raise HTTPException(404, f"{rev}:{path} 不存在")
+    return {"rev": rev, "path": path, "content": content}
+
+
+@router.get("/books/{book}/git/history")
+def git_history(book: str, path: str, limit: int = 30, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    from ..core.gitbot import GitBot
+
+    bc = _book(ctx, book)
+    return {"path": path, "history": GitBot(bc.store.root).file_history(path, limit)}
+
+
+# ---------------------------------------------------------------- threads / profiles
+
+
+@router.get("/books/{book}/threads")
+def get_threads(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    return {"threads": [t.model_dump(mode="json") for t in bc.store.load_threads()]}
+
+
+class ThreadReq(CappedModel):
+    id: str
+    name: str
+    kind: str = "main"
+    status: str = "active"
+    progress: str = ""
+    last_ch: int = 0
+    beats: list[str] = Field(default_factory=list)
+
+
+@router.put("/books/{book}/threads")
+def put_thread(book: str, req: ThreadReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    t = Thread.model_validate(req.model_dump())
+    try:
+        bc.store.save_thread(t)
+    except StoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return t.model_dump(mode="json")
+
+
+@router.get("/books/{book}/profiles")
+def get_profiles(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    return {
+        "profiles": {name: bc.store.load_profile(name).model_dump(mode="json") for name in bc.store.list_profiles()}
+    }
+
+
+@router.put("/books/{book}/profiles/{platform}")
+def put_profile(book: str, platform: str, req: dict[str, Any] = Body(...), ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    bc = _book(ctx, book)
+    data = dict(req)
+    data["platform"] = platform
+    prof = PlatformProfile.model_validate(data)
+    try:
+        bc.store.save_profile(prof)
+    except StoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return prof.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------- 灵感速记（PWA 回流）
+
+
+class InspirationReq(CappedModel):
+    #: 该字段由专属守卫负责（`_cap_text` / `_cap_chapters`），会报更精确的消息
+    CAP_SKIP: ClassVar[frozenset[str]] = frozenset({"notes"})
+
+    notes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/books/{book}/inspiration")
+def add_inspiration(book: str, req: InspirationReq, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """移动端 PWA 的离线段落回流（§13.3）。
+
+    落 materials/inspiration.md（不是 truth/，灵感不是真相源，不进 Curator 白名单）。
+    """
+    bc = _book(ctx, book)
+    if not req.notes:
+        raise HTTPException(400, "notes 不能为空")
+    if len(req.notes) > MAX_INSPIRATION_NOTES:
+        raise HTTPException(400, f"notes 过多（上限 {MAX_INSPIRATION_NOTES} 条）")
+    path = bc.store.p.materials / "inspiration.md"
+    kind_label = {"idea": "灵感", "hook": "断章钩", "setting": "设定", "foreshadow": "伏笔", "dialogue": "台词"}
+    lines = []
+    for n in req.notes:
+        text = str(n.get("text", "")).strip()
+        if len(text) > MAX_NOTE_CHARS:
+            raise HTTPException(400, f"单条速记过长（上限 {MAX_NOTE_CHARS} 字）")
+        if not text:
+            continue
+        kind = kind_label.get(str(n.get("kind", "idea")), "灵感")
+        ts = n.get("ts")
+        try:
+            stamp = dt.datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines.append(f"- [{kind}] {text}  \n  <sub>{stamp}</sub>")
+    if not lines:
+        raise HTTPException(400, "没有有效条目")
+    # 缺陷 #88：并发速记必须整体持锁追加（见 atomic.append_text 的说明）
+    atomic.append_text(path, "\n".join(lines), header="# 灵感速记\n\n")
+    from ..core.gitbot import GitBot
+
+    commit = GitBot(bc.store.root).commit_all(f"materials: 灵感速记 +{len(lines)} 条")
+    return {"accepted": len(lines), "path": bc.store.rel(path), "commit": commit.__dict__}
+
+
+# ---------------------------------------------------------------- 定时任务（夜审/索引）
+
+
+@router.post("/books/{book}/jobs/nightly")
+async def nightly(book: str, ctx: AppContext = Depends(_ctx)) -> dict[str, Any]:
+    """手动触发夜审批处理（§9.1 夜间批审）。"""
+    bc = _book(ctx, book)
+    drafted = [o.ch for o in bc.store.list_outlines() if o.status == "drafted"]
+    results = []
+    for ch in drafted:
+        try:
+            r = await bc.reviewer.review(ch, use_model=True)
+            results.append({"ch": ch, "issues": len(r.report.issues), "path": r.path})
+        except Exception as exc:
+            results.append({"ch": ch, "error": f"{type(exc).__name__}: {exc}"})
+    idx = None
+    idx_verify = None
+    if bc.retrieval is not None:
+        try:
+            idx = bc.retrieval.build_index(full=False)
+            # 与夜间定时任务一致：重建后立刻做 hash 对账，异常显式返回（§15）
+            idx_verify = bc.retrieval.verify()
+        except Exception as exc:
+            idx = {"error": str(exc)}
+    # 缺陷 #110：整批结果里只要有任意一章失败（或索引对账没通过），必须在响应
+    # 顶层说出口。此前失败只埋在 reviewed[i].error 里，而 PWA 的 triggerNightly
+    # 只弹「夜审已触发：N 章」——N 是成功+失败的总数，作者看到「3 章」就以为
+    # 三章都审过了，实际可能一章都没审成。
+    failed = [e for e in results if e.get("error")]
+    warnings: list[str] = []
+    if failed:
+        warnings.append(
+            "夜审有 %d 章失败：%s"
+            % (len(failed), "、".join(f"第 {e['ch']} 章" for e in failed[:5]))
+        )
+    if idx_verify is not None and not idx_verify.get("ok", True):
+        warnings.append("索引对账不通过：%s" % idx_verify)
+    return {
+        "reviewed": results,
+        "ok": not failed and (idx_verify is None or idx_verify.get("ok", True)),
+        "warnings": warnings,
+        "index": idx,
+        "index_verify": idx_verify,
+    }
