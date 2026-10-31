@@ -1,5 +1,7 @@
 # 网文通用工作流工作台
 
+[![GitHub](https://img.shields.io/badge/GitHub-ae1335%2Fmoran-blue)](https://github.com/ae1335/moran)
+
 > 本地优先 · 文件即真相源 · BYOK 多模型的个人长篇网文创作工作台
 >
 > 按《网文工作台架构方案计划书 v2.0》实现。**M1–M8 全部落地**，离线可跑通。
@@ -34,7 +36,7 @@ cd web && npx vite build                 # 构建后由主服务直接托管
 
 | 步骤 | 内容 |
 |---|---|
-| 1–2 | Python 单测（322 项）+ 前端构建 |
+| 1–2 | Python 单测（446 项）+ 前端构建 |
 | 3–4 | 起服务 + API 冒烟（含未知 `/api` 必须 404） |
 | 5 | 浏览器 UI 冒烟（15 个页面，收集控制台错误） |
 | 6 | **PWA 离线队列 / 夜审 / 索引漂移** 端到端（35 项，真断网） |
@@ -76,7 +78,7 @@ Agent    Planner → Writer → Reviewer → Curator（+ 拆书 Agent 离线）
 数据层   truth/ outline/ chapters/ memory/ analysis/ materials/ feedback/ → git
 ```
 
-依赖方向单向：`api → agents → context/model → core`，**禁止反向依赖**。 由 `tests/test_architecture.py` 用 AST 全量扫描守护（此前零测试，纯靠人看代码）；实测当前 0 处反向依赖，注入 `core → agents` 会立即失败并报出精确行号。
+依赖方向单向：`api → agents → context/model → core`，**禁止反向依赖**。 由 `tests/test_architecture.py` 用 AST 全量扫描守护（129 个缺陷已修复）；实测当前 0 处反向依赖，注入 `core → agents` 会立即失败并报出精确行号。
 
 ---
 
