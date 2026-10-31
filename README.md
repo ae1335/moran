@@ -36,7 +36,7 @@ cd web && npx vite build                 # 构建后由主服务直接托管
 
 | 步骤 | 内容 |
 |---|---|
-| 1–2 | Python 单测（446 项）+ 前端构建 |
+| 1–2 | Python 单测（454 项）+ 前端构建 |
 | 3–4 | 起服务 + API 冒烟（含未知 `/api` 必须 404） |
 | 5 | 浏览器 UI 冒烟（15 个页面，收集控制台错误） |
 | 6 | **PWA 离线队列 / 夜审 / 索引漂移** 端到端（35 项，真断网） |
@@ -102,7 +102,7 @@ server/
 └── cli.py        命令行（M1：无前端也能跑通）
 web/              Vue 3 + Vite 三栏工作台
 pwa/              移动端灵感速记（离线 queue → 联网同步）
-tests/            216 项单测 + 集成测试
+tests/            224 项单测 + 集成测试
 ```
 
 ---
@@ -267,7 +267,7 @@ GET  /api/templates                      工作区级模板库
 ## 测试
 
 ```bash
-PYTHONPATH=vendor/pylib:. python3 -m pytest tests/ -q    # 305 项单测全绿
+PYTHONPATH=vendor/pylib:. python3 -m pytest tests/ -q    # 454 项单测全绿
 bash scripts/verify-all.sh 8793                          # 全量：单测 + 构建 + 服务 + API + 浏览器
 bash scripts/make-demo.sh ws                             # 重建 8 章离线 demo
 ```
@@ -291,11 +291,11 @@ REST+SSE 集成（含 M1 全链路验收）。
 ## 验证
 
 完整验证过程与结果见 [`docs/VERIFICATION.md`](docs/VERIFICATION.md)，含：
-- 213 项单测分布、前端构建产物
+- 224 项单测分布、前端构建产物
 - 8 章端到端流水线产物核对表
 - 15 个 REST 端点真实 HTTP 状态
 - 14 个页面在真实 Chromium 的渲染结果与截图
-- **开发中修复的 34 个真实缺陷**（可复现 + 有回归测试）
+- **开发中修复的 130 个真实缺陷**（可复现 + 有回归测试）
 - 8 条未验证项（真实模型/embedding/PWA 真机等）
 
 ---

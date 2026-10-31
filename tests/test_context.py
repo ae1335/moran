@@ -447,3 +447,23 @@ def test_l5_never_leaks_dotfile_into_context(tmp_path):
     assert "SECRET_TOKEN" not in lay.content
     assert "LEAKED_KEY_VALUE" not in lay.content
     assert "未找到" in lay.content
+
+def test_load_book_failure_warns_about_context_budget(tmp_path):
+    """#130: load_book 挂了，静默用默认 16000，作者改的 context_budget 被悄悄忽略。
+    修复后：warnings 必须含「book.yaml 读取失败…上下文预算已降级为默认 16000」。"""
+    store = _book(tmp_path)
+    store.p.book_json.write_text('not: valid: yaml: [', encoding='utf-8')
+    assembler = ContextAssembler(store)
+    ctx = asyncio.run(assembler.assemble(_outline()))
+    assert any('book.yaml 读取失败' in w and '上下文预算' in w for w in ctx.warnings), (
+        f"#130: load_book 挂了却没警告，warnings={ctx.warnings}"
+    )
+
+
+def test_load_book_ok_no_budget_warning(tmp_path):
+    """对照组：book.yaml 正常时不该有预算警告。"""
+    store = _book(tmp_path)
+    assembler = ContextAssembler(store)
+    ctx = asyncio.run(assembler.assemble(_outline()))
+    budget_warnings = [w for w in ctx.warnings if 'book.yaml 读取失败' in w]
+    assert not budget_warnings, f"#130: 正常时不该有预算警告，实际={budget_warnings}"

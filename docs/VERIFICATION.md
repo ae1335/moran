@@ -4,7 +4,7 @@
 
 ## 一句话结论
 
-**单测 446 条用例全绿（pytest 收集 452 项，含 6 条参数化展开；1 项跳过）；前端构建通过；15 个页面在真实 Chromium 里零控制台错误；PWA 离线队列 35 项 + 定时任务实跑 15 项端到端全通；8 章流水线跑通并导出。**
+**单测 448 条用例全绿（pytest 收集 454 项，含 6 条参数化展开；1 项跳过）；前端构建通过；15 个页面在真实 Chromium 里零控制台错误；PWA 离线队列 35 项 + 定时任务实跑 15 项端到端全通；8 章流水线跑通并导出。**
 
 ## 复现命令
 
@@ -29,7 +29,7 @@ $ PYTHONPATH=vendor/pylib:. python3 -m pytest tests/ -q
 | `tests/test_model.py` (41) | 路由解析、回环强制、熔断、脱敏重试、JSON 抽取、token 估算、mock 文笔质量、章名唯一性 |
 | `tests/test_api.py` (71) | REST 全链路、SSE 流式、路径逃逸拦截、未知 API 返回 404 JSON、导出预检（#123 真扫套语）、/polish、起名、静态资源 |
 | `tests/test_platform.py` (28) | 导出预检/红线/钩子、反 AI 味润色（#123 预检真扫套语）、日更面板、统计曲线 |
-| `tests/test_context.py` (22) | 6 层装配、L0/L1 空则拒生成、预算裁剪顺序、`@路径` 解析、检索降级不阻断、few-shot 片段注入 |
+| `tests/test_context.py` (24) | 6 层装配、L0/L1 空则拒生成、预算裁剪顺序、`@路径` 解析、检索降级不阻断、few-shot 片段注入 |
 | `tests/test_pwa_inspiration.py` (5) | PWA 挂载、定时任务默认关闭、灵感入库 |
 | `tests/test_fix_suggest.py` (17) | 套语替换/POV 删句/复读删句/diff 可读性/不落盘 |
 | `tests/test_naming.py` (16) | 起名四类、seed 可复现、长度约束、去重、词池落盘与读取 |
@@ -378,7 +378,7 @@ bash scripts/verify-all.sh        # 7 步全量，末行 RESULT=PASS|FAIL
 | 127 | **embedding 失败时索引静默缺向量，build / verify / 门面档位三处同时说谎** | `IndexBuilder._embed_pending` 是 `except Exception: return 0`（注释写着「不影响 BM25 主链路」），异常串直接丢。探针实测（embedder 抛 RuntimeError 模拟上游 502）：`build` 返回 `{embedded: 0, error: '', chunks: 12, vectors: 0}`、`stats` 报 `mode='hybrid'`、`verify` 返回 `ok=True` —— **三处全在说谎**：检索实际已退回纯 BM25，而 README:73 承诺的「FTS5(BM25) + 向量 + RRF(k=60)」此刻只有前者。真实书库现场：演示书 `index.db` 实测 chunks=39 / **vectors=0** / `meta.embedder=''`，一直在「hybrid 门面 + 零向量」状态下跑 | `_embed_pending` 把异常记进 `self._embed_error`；新增 `_vector_source(stats)` 把「向量缺失」翻成中文并区分成因（embedding 跑挂 → 带异常原文；压根没配 → 只陈述事实）；`build` 报告新增 `vector_source` 字段；`verify` 新增 `vector_source` 并**按成因**并入 `ok`（配了 embedder 却零向量 → 不通过；没配 → 只提示不判红，否则对账永远红没人看）；`facade.mode` 不再只看「有没有 embedder」，零向量一律报 `bm25`；`facade` 六处早退分支补 `vector_source`/`entity_source` 键（缺键会让前端读 undefined 后静默跳过）。出口三层：CLI `moran index verify` 新增「向量缺失」告警且退出码非 0；`DailyView.indexProblems` push 该说明；`rebuildIndex` 命中时弹 warn toast | `tests/test_retrieval.py::test_build_reports_vector_source_when_embedding_fails`、`::test_verify_flags_missing_vectors`、`::test_verify_ok_when_vectors_present`、`::test_verify_tolerates_unconfigured_embedding`、`::test_facade_mode_does_not_claim_hybrid_without_vectors`、`::test_facade_early_returns_carry_vector_source_key`、`tests/test_core.py::test_cli_index_verify_reports_missing_vectors`、`tests/test_frontend.py::test_index_verify_reports_missing_vectors_to_author`、`::test_index_rebuild_reports_missing_vectors`。反向验证五处（摘错误记录 / 摘 verify 并入 / 摘 facade.mode / 两处前端分支短路）均真红后还原 |
 | 128 | **只读打开 WAL 库凭空造出 `-wal` / `-shm`，基线校验假红** | `IndexBuilder.connect(create=False)` 用 `mode=ro` 打开索引库。WAL 模式的库哪怕只读打开，SQLite 也会新建这两个旁文件（正文一个字节没变、`git status` 干净）。`verify-all.sh` 第 3~5 步的防线按「书库目录所有文件 md5 汇总」做基线，UI 冒烟进书架页（DailyView 挂载即调 `indexVerify`）就多出 32KB `index.db-shm` → 报「真实书库被改写」整轮 `RESULT=FAIL`。假红和假绿一样致命：这道防线第一次哭狼之后就没人信了 | 只读连接改为 `mode=ro&immutable=1`：告诉 SQLite 该文件此刻不会变，不加锁、不建旁文件（实测读到内容一致、库文件字节前后相同）；写连接不受影响仍走 WAL+NORMAL | `tests/test_retrieval.py::test_read_only_connect_does_not_create_wal_sidecars`、`::test_read_only_connect_still_sees_the_data`（后者是对照组：immutable 不能把库读空）。反向验证：去掉 `immutable=1` → 真红 `['index.db'] -> ['index.db', 'index.db-shm', 'index.db-wal']`，还原后转绿 |
 | 129 | **PWA 夜审只消费 warnings，漏掉 index_verify.vector_source** | `POST /jobs/nightly` 返回 `{reviewed, ok, warnings, index, index_verify}`。PWA `triggerNightly` 只读了 `warnings`，但 embedding 没跑成时 `vector_source` 在 `index_verify` 里而不在 `warnings` 里 —— 作者点了「夜审」却不知道索引悄悄退回纯 BM25，还以为一切正常 | `triggerNightly` 补读 `r.index_verify.vector_source` 与 `r.index.vector_source`（去重后拼进告警），作者才能看到「索引对账：向量缺失…」 | `tests/test_frontend.py::test_pwa_nightly_alerts_on_index_vector_source`。反向验证：删掉 `index_verify` 消费代码 → 真红，还原后转绿 |
-| 128 | **只读读索引库会在库旁边凭空造出 `-wal` / `-shm`，基线校验因此假红** | `IndexBuilder.connect(create=False)` 用 `mode=ro` 打开索引库。WAL 模式的库哪怕只读打开，SQLite 也会新建这两个旁文件（内容一个字节没变、`git status` 干净）。而 `scripts/verify-all.sh` 第 3~5 步的防线是「真实书库目录下所有文件 md5 汇总」，UI 冒烟一进书架页（DailyView 挂载即调 `indexVerify`）就多出 32KB 的 `index.db-shm` → 校验报「真实书库被改写」，整轮 `RESULT=FAIL`。假红和假绿一样致命：这道防线本来是 #51 之后专门防「测错对象/污染真实书库」的，第一次哭狼之后就没人信了 | 只读连接改为 `mode=ro&immutable=1`：告诉 SQLite 该文件此刻不会变，不加锁、不建旁文件（实测读到的内容一致、库文件字节前后相同）；写连接不受影响，仍走 WAL + NORMAL | `tests/test_retrieval.py::test_read_only_connect_does_not_create_wal_sidecars`、`::test_read_only_connect_still_sees_the_data`（后者是对照组：`immutable=1` 不能把库读空）。反向验证：去掉 `immutable=1` → 真红 `['index.db'] -> ['index.db', 'index.db-shm', 'index.db-wal']`，还原后转绿 |
+| 130 | **load_book 失败静默降级，作者改的 context_budget 被悄悄忽略** | server/api/deps.py:57 与 server/context/assembler.py:146 两处 except Exception: pass 后静默用默认 16000，零告警 | 破坏 book.json 为非法 YAML，assemble() 后 ctx.warnings 无任何提示 | 两处 except 改为记 warning「book.yaml 读取失败：{类型}，上下文预算已降级为默认 16000」 | assembler.warnings 直接注入 + deps.py 同步，两条守卫测试（含对照组） | 反向验证：摘 assembler warning → test_load_book_failure_warns_about_context_budget 真红；还原后转绿 |
 
 **单测与端到端的分工**（别把两者混为一谈）：`tests/test_scheduler.py` 21 项覆盖 job 函数、配置解析、注册逻辑与 lifespan 装配；但「cron 到点会不会真的把任务调起来」只能靠 `scripts/scheduler-smoke.sh` 真等服务跑——两者都跑才算闭环。
 

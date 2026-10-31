@@ -52,12 +52,17 @@ class BookContext:
     def assembler(self) -> ContextAssembler:
         if self._assembler is None:
             book = None
+            book_err = ""
             try:
                 book = self.store.load_book()
-            except Exception:
-                pass
+            except Exception as exc:
+                # 缺陷 #130：load_book 挂了，静默用默认 16000，作者改的 context_budget 被悄悄忽略。
+                # 必须记 warning，否则作者永远不知道为什么预算没生效。
+                book_err = f"book.yaml 读取失败：{type(exc).__name__}，上下文预算已降级为默认 16000"
             budget = book.context_budget if book else 16000
             self._assembler = ContextAssembler(self.store, retrieval=self.retrieval, budget=budget)
+            if book_err:
+                self._assembler.warnings.append(book_err)
         return self._assembler
 
     @property

@@ -143,8 +143,12 @@ class ContextAssembler:
         book = None
         try:
             book = self.store.load_book()
-        except Exception:
-            pass
+        except Exception as exc:
+            # 缺陷 #130：load_book 挂了，静默用默认 16000，作者改的 context_budget 被悄悄忽略。
+            # 必须记 warning，否则作者永远不知道为什么预算没生效。
+            warnings.append(
+                f"book.yaml 读取失败：{type(exc).__name__}，上下文预算已降级为默认 {self.budget}"
+            )
         title = book_title or (book.title if book else "")
         budget = self.budget
 
